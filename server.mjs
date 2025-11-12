@@ -1,4 +1,3 @@
-// server.mjs
 import 'dotenv/config';
 import express from 'express';
 import axios from 'axios';
@@ -7,52 +6,60 @@ import crypto from 'crypto';
 import { SignJWT, importPKCS8 } from 'jose';
 import fs from 'fs/promises';
 
-// ---- Config from environment (set these in Render) ----
+// ======================
+// CONFIG
+// ======================
 const cfg = {
-  base: process.env.ASB_BASE,            // e.g., https://api.asb.io/v2.3/open-banking-nz
-  auth: process.env.ASB_AUTH,            // e.g., https://asb.glueware.dev/oauth/v2.0
+  base: process.env.ASB_BASE,              // https://api.asb.io/v2.3/open-banking-nz
+  auth: process.env.ASB_AUTH,              // https://asb.glueware.dev/oauth/v2.0
   clientId: process.env.CLIENT_ID,
-  redirect: process.env.REDIRECT_URI,    // e.g., https://<render>.onrender.com/auth/callback
-  mtlsCert: process.env.MTLS_CERT,       // e.g., /etc/secrets/client_cert.pem
-  mtlsKey: process.env.MTLS_KEY,         // e.g., /etc/secrets/client_key.pem
-  oidcPk: process.env.OIDC_PRIVATE_KEY,  // e.g., /etc/secrets/private_key.pem
-  oidcKid: process.env.OIDC_KID,         // from your ASB app (KID)
-  apiKey: process.env.API_KEY
+  redirect: process.env.REDIRECT_URI,      // https://asb-xsea.onrender.com/auth/callback
+  mtlsCert: process.env.MTLS_CERT,         // /etc/secrets/client_cert.pem
+  mtlsKey: process.env.MTLS_KEY,           // /etc/secrets/client_key.pem
+  oidcPk: process.env.OIDC_PRIVATE_KEY,    // /etc/secrets/private_key.pem
+  oidcKid: process.env.OIDC_KID,           // cf70509a-4b97-4cf5-9609-cd313c19aecc
+  apiKey: process.env.API_KEY              // Random secret for /sync
 };
 
 if (!cfg.base || !cfg.auth || !cfg.clientId || !cfg.redirect) {
-  console.error("Missing mandatory environment variables. Check .env.example");
+  console.error("❌ Missing mandatory environment variables.");
   process.exit(1);
 }
 
 const app = express();
 app.use(express.json());
 
-// ---- mTLS agent for all ASB calls ----
+// ======================
+// mTLS Agent
+// ======================
 const mtlsAgent = new https.Agent({
   cert: await fs.readFile(cfg.mtlsCert),
-  key:  await fs.readFile(cfg.mtlsKey)
+  key: await fs.readFile(cfg.mtlsKey)
 });
 
-// ---- Helper: sign client assertion JWT for token endpoint (private_key_jwt, RS256) ----
+// ======================
+// JWT Client Assertion
+// ======================
 async function clientAssertion(aud) {
   const pkcs8 = await fs.readFile(cfg.oidcPk, 'utf8');
-  const alg = 'RS256'; // <— switched from PS256 to RS256
+  const alg = 'PS256';
   const key = await importPKCS8(pkcs8, alg);
   const now = Math.floor(Date.now() / 1000);
   const jti = crypto.randomBytes(16).toString('hex');
 
   return await new SignJWT({ jti })
-    .setProtectedHeader({ alg, kid: cfg.oidcKid, typ: 'JWT' })
-    .setIssuer(cfg.clientId)     // iss = client_id
-    .setSubject(cfg.clientId)    // sub = client_id
-    .setAudience(aud)            // aud = token endpoint URL
+    .setProtectedHeader({ alg: 'PS256', kid: cfg.oidcKid })
+    .setIssuer(cfg.clientId)
+    .setSubject(cfg.clientId)
+    .setAudience(aud)
     .setIssuedAt(now)
-    .setExpirationTime(now + 300) // 5 minutes
+    .setExpirationTime(now + 300)
     .sign(key);
 }
 
-// ---- Helper: get client_credentials token to create consent ----
+// ======================
+// Token + Consent Helpers
+// ======================
 async function getClientCredentialsToken() {
   const tokenUrl = `${cfg.auth}/token`;
   const assertion = await clientAssertion(tokenUrl);
@@ -70,7 +77,6 @@ async function getClientCredentialsToken() {
   return data.access_token;
 }
 
-// ---- Helper: create account-access consent (balances + transactions only) ----
 async function createAccountAccessConsent(clientToken) {
   const body = {
     Data: {
@@ -91,14 +97,15 @@ async function createAccountAccessConsent(clientToken) {
   return data?.Data?.ConsentId;
 }
 
-// ---- Helper: build signed Request Object (JWS) embedding ConsentId (RS256) ----
+// ======================
+// Request Object (for authorization)
+// ======================
 async function buildRequestObject({ consentId, state, nonce }) {
   const pkcs8 = await fs.readFile(cfg.oidcPk, 'utf8');
-  const alg = 'RS256'; // <— using RS256 for the request object as well
+  const alg = 'PS256';
   const key = await importPKCS8(pkcs8, alg);
   const now = Math.floor(Date.now() / 1000);
 
-  // Per NZ OBL profile, ConsentId goes in id_token claims
   const payload = {
     iss: cfg.clientId,
     aud: `${cfg.auth}/authorize`,
@@ -109,49 +116,40 @@ async function buildRequestObject({ consentId, state, nonce }) {
     state,
     nonce,
     claims: {
-      id_token: {
-        ConsentId: { essential: true, value: consentId }
-      }
+      id_token: { ConsentId: { essential: true, value: consentId } }
     },
     exp: now + 300,
     iat: now
   };
 
   return await new SignJWT(payload)
-    .setProtectedHeader({ alg, kid: cfg.oidcKid, typ: 'JWT' })
+    .setProtectedHeader({ alg: 'PS256', kid: cfg.oidcKid })
     .sign(key);
 }
 
-// ---- /auth/start: create consent + send only `request` (no request_uri) ----
+// ======================
+// ROUTES
+// ======================
 app.get('/auth/start', async (req, res) => {
   try {
     const state = crypto.randomBytes(16).toString('hex');
     const nonce = crypto.randomBytes(16).toString('hex');
-
-    // 1) Get client token
     const clientToken = await getClientCredentialsToken();
-
-    // 2) Create consent with minimal read permissions
     const consentId = await createAccountAccessConsent(clientToken);
-
-    // 3) Build signed request object
     const requestJws = await buildRequestObject({ consentId, state, nonce });
 
-    // 4) Redirect with ONLY client_id + request (no request_uri)
     const authUrl = new URL(`${cfg.auth}/authorize`);
     authUrl.searchParams.set('client_id', cfg.clientId);
     authUrl.searchParams.set('request', requestJws);
 
-    return res.redirect(authUrl.toString());
+    res.redirect(authUrl.toString());
   } catch (e) {
-    console.error('auth/start error', e.response?.data || e.message);
-    return res
+    res
       .status(500)
       .send(`auth/start error: ${e.response?.data ? JSON.stringify(e.response.data) : e.message}`);
   }
 });
 
-// ---- /auth/callback: exchange auth code for tokens, show refresh token once ----
 app.get('/auth/callback', async (req, res) => {
   try {
     const tokenUrl = `${cfg.auth}/token`;
@@ -171,7 +169,7 @@ app.get('/auth/callback', async (req, res) => {
     res
       .status(200)
       .send(
-        `Copy this REFRESH TOKEN and save it as <code>ASB_REFRESH_TOKEN</code> in Render:<br><br><code style="word-break:break-all">${data.refresh_token}</code>`
+        `✅ Copy this REFRESH TOKEN and save it as <code>ASB_REFRESH_TOKEN</code> in Render:<br><br><code style="word-break:break-all">${data.refresh_token}</code>`
       );
   } catch (e) {
     res
@@ -180,7 +178,6 @@ app.get('/auth/callback', async (req, res) => {
   }
 });
 
-// ---- Helper: refresh access token using stored refresh token ----
 async function refreshAccessToken(refreshToken) {
   const tokenUrl = `${cfg.auth}/token`;
   const assertion = await clientAssertion(tokenUrl);
@@ -198,10 +195,10 @@ async function refreshAccessToken(refreshToken) {
   return data.access_token;
 }
 
-// ---- /sync: fetch accounts, balances, transactions ----
 app.get('/sync', async (req, res) => {
   try {
-    if (req.header('x-api-key') !== cfg.apiKey) return res.status(401).json({ error: 'unauthorized' });
+    if (req.header('x-api-key') !== cfg.apiKey)
+      return res.status(401).json({ error: 'unauthorized' });
 
     const refreshToken = process.env.ASB_REFRESH_TOKEN;
     if (!refreshToken) return res.status(400).json({ error: 'missing ASB_REFRESH_TOKEN' });
@@ -232,7 +229,5 @@ app.get('/sync', async (req, res) => {
   }
 });
 
-// ---- Health check ----
-app.get('/', (req, res) => res.send('ASB Open Banking connector is running.'));
-
-app.listen(process.env.PORT || 8080, () => console.log('ASB connector running on port 8080'));
+app.get('/', (_, res) => res.send('💫 ASB Open Banking connector is running.'));
+app.listen(process.env.PORT || 8080, () => console.log('✅ ASB connector running on port 8080'));
