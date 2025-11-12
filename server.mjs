@@ -1,4 +1,4 @@
-// server.mjs
+// server.mjs (env-tunable)
 import 'dotenv/config';
 import express from 'express';
 import axios from 'axios';
@@ -19,7 +19,12 @@ const cfg = {
   mtlsKey: process.env.MTLS_KEY,           // /etc/secrets/client_key.pem
   oidcPk: process.env.OIDC_PRIVATE_KEY,    // /etc/secrets/private_key.pem
   oidcKid: process.env.OIDC_KID,           // cf70509a-4b97-4cf5-9609-cd313c19aecc
-  apiKey: process.env.API_KEY              // your chosen API key for /sync
+  apiKey: process.env.API_KEY,             // your chosen API key for /sync
+  // Tunables
+  algToken: (process.env.ALG_TOKEN || 'PS256').toUpperCase(),        // PS256 or RS256
+  algRequest: (process.env.ALG_REQUEST || 'PS256').toUpperCase(),    // PS256 or RS256
+  kidHeader: (process.env.KID_HEADER || 'true').toLowerCase() === 'true', // include kid?
+  includeClientIdInTokenBody: (process.env.INCLUDE_CLIENT_ID_IN_TOKEN_BODY || 'true').toLowerCase() === 'true'
 };
 
 if (!cfg.base || !cfg.auth || !cfg.clientId || !cfg.redirect) {
@@ -41,33 +46,36 @@ const mtlsAgent = new https.Agent({
 // ======================
 // JWT helpers
 // ======================
-
-// Token endpoint assertion: **RS256**
-async function clientAssertion(aud) {
+async function signJwt(payload, { alg, aud, includeKid = true }) {
   const pkcs8 = await fs.readFile(cfg.oidcPk, 'utf8');
-  const key = await importPKCS8(pkcs8, 'RS256');
+  const key = await importPKCS8(pkcs8, alg);
   const now = Math.floor(Date.now() / 1000);
   const jti = crypto.randomBytes(16).toString('hex');
 
-  return await new SignJWT({ jti })
-    .setProtectedHeader({ alg: 'RS256', kid: cfg.oidcKid, typ: 'JWT' })
-    .setIssuer(cfg.clientId)     // iss = client_id
-    .setSubject(cfg.clientId)    // sub = client_id
-    .setAudience(aud)            // aud = token endpoint URL
+  const jwt = await new SignJWT({ ...payload, jti })
+    .setProtectedHeader(includeKid ? { alg, kid: cfg.oidcKid, typ: 'JWT' } : { alg, typ: 'JWT' })
+    .setIssuer(cfg.clientId)
+    .setSubject(cfg.clientId)
+    .setAudience(aud)
     .setIssuedAt(now)
     .setExpirationTime(now + 300)
     .sign(key);
+
+  return jwt;
 }
 
-// Authorization request object: **PS256**
-async function buildRequestObject({ consentId, state, nonce }) {
-  const pkcs8 = await fs.readFile(cfg.oidcPk, 'utf8');
-  const key = await importPKCS8(pkcs8, 'PS256');
-  const now = Math.floor(Date.now() / 1000);
+// Token endpoint assertion (private_key_jwt)
+async function clientAssertion(aud) {
+  return signJwt({}, { alg: cfg.algToken, aud, includeKid: cfg.kidHeader });
+}
 
+// Authorization request object
+async function buildRequestObject({ consentId, state, nonce }) {
+  const aud = `${cfg.auth}/authorize`;
+  const now = Math.floor(Date.now() / 1000);
   const payload = {
     iss: cfg.clientId,
-    aud: `${cfg.auth}/authorize`,
+    aud,
     client_id: cfg.clientId,
     response_type: 'code id_token',
     redirect_uri: cfg.redirect,
@@ -78,10 +86,7 @@ async function buildRequestObject({ consentId, state, nonce }) {
     exp: now + 300,
     iat: now
   };
-
-  return await new SignJWT(payload)
-    .setProtectedHeader({ alg: 'PS256', kid: cfg.oidcKid, typ: 'JWT' })
-    .sign(key);
+  return signJwt(payload, { alg: cfg.algRequest, aud, includeKid: cfg.kidHeader });
 }
 
 // ======================
@@ -90,13 +95,16 @@ async function buildRequestObject({ consentId, state, nonce }) {
 async function getClientCredentialsToken() {
   const tokenUrl = `${cfg.auth}/token`;
   const assertion = await clientAssertion(tokenUrl);
-  const form = new URLSearchParams({
+
+  const body = {
     grant_type: 'client_credentials',
     scope: 'openid accounts',
-    client_id: cfg.clientId,
     client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
     client_assertion: assertion
-  });
+  };
+  if (cfg.includeClientIdInTokenBody) body.client_id = cfg.clientId;
+
+  const form = new URLSearchParams(body);
   const { data } = await axios.post(tokenUrl, form, {
     httpsAgent: mtlsAgent,
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
@@ -127,14 +135,16 @@ async function createAccountAccessConsent(clientToken) {
 async function refreshAccessToken(refreshToken) {
   const tokenUrl = `${cfg.auth}/token`;
   const assertion = await clientAssertion(tokenUrl);
-  const body = new URLSearchParams({
+  const body = {
     grant_type: 'refresh_token',
     refresh_token: refreshToken,
-    client_id: cfg.clientId,
     client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
     client_assertion: assertion
-  });
-  const { data } = await axios.post(tokenUrl, body, {
+  };
+  if (cfg.includeClientIdInTokenBody) body.client_id = cfg.clientId;
+
+  const form = new URLSearchParams(body);
+  const { data } = await axios.post(tokenUrl, form, {
     httpsAgent: mtlsAgent,
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
   });
@@ -142,7 +152,7 @@ async function refreshAccessToken(refreshToken) {
 }
 
 // ======================
-// Routes
+// Diagnostics
 // ======================
 app.get('/diag/jwt', async (_req, res) => {
   try {
@@ -153,6 +163,12 @@ app.get('/diag/jwt', async (_req, res) => {
     const payloadJson = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
     res.json({
       ok: true,
+      env: {
+        ALG_TOKEN: cfg.algToken,
+        ALG_REQUEST: cfg.algRequest,
+        KID_HEADER: cfg.kidHeader,
+        INCLUDE_CLIENT_ID_IN_TOKEN_BODY: cfg.includeClientIdInTokenBody
+      },
       kid: cfg.oidcKid,
       client_id: cfg.clientId,
       aud,
@@ -180,21 +196,18 @@ app.get('/diag/token', async (_req, res) => {
   }
 });
 
+// ======================
+// Main flow
+// ======================
 app.get('/auth/start', async (_req, res) => {
   try {
     const state = crypto.randomBytes(16).toString('hex');
     const nonce = crypto.randomBytes(16).toString('hex');
 
-    // 1) client credentials for consent creation
     const clientToken = await getClientCredentialsToken();
-
-    // 2) create consent with minimal read perms
     const consentId = await createAccountAccessConsent(clientToken);
-
-    // 3) signed request object (PS256)
     const requestJws = await buildRequestObject({ consentId, state, nonce });
 
-    // 4) redirect with ONLY client_id + request
     const authUrl = new URL(`${cfg.auth}/authorize`);
     authUrl.searchParams.set('client_id', cfg.clientId);
     authUrl.searchParams.set('request', requestJws);
@@ -211,23 +224,23 @@ app.get('/auth/callback', async (req, res) => {
   try {
     const tokenUrl = `${cfg.auth}/token`;
     const assertion = await clientAssertion(tokenUrl);
-    const body = new URLSearchParams({
+    const body = {
       grant_type: 'authorization_code',
       code: req.query.code,
       redirect_uri: cfg.redirect,
-      client_id: cfg.clientId,
       client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
       client_assertion: assertion
-    });
-    const { data } = await axios.post(tokenUrl, body, {
+    };
+    if (cfg.includeClientIdInTokenBody) body.client_id = cfg.clientId;
+
+    const form = new URLSearchParams(body);
+    const { data } = await axios.post(tokenUrl, form, {
       httpsAgent: mtlsAgent,
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     });
     res
       .status(200)
-      .send(
-        `Copy this REFRESH TOKEN and save it as <code>ASB_REFRESH_TOKEN</code> in Render:<br><br><code style="word-break:break-all">${data.refresh_token}</code>`
-      );
+      .send(`Copy this REFRESH TOKEN and save it as <code>ASB_REFRESH_TOKEN</code> in Render:<br><br><code style="word-break:break-all">${data.refresh_token}</code>`);
   } catch (e) {
     res
       .status(500)
