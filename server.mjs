@@ -34,17 +34,19 @@ const mtlsAgent = new https.Agent({
   key:  await fs.readFile(cfg.mtlsKey)
 });
 
-// ---- Helper: sign client assertion JWT for token endpoint (private_key_jwt) ----
+// ---- Helper: sign client assertion JWT for token endpoint (private_key_jwt, RS256) ----
 async function clientAssertion(aud) {
   const pkcs8 = await fs.readFile(cfg.oidcPk, 'utf8');
-  const alg = 'PS256';
+  const alg = 'RS256'; // <— switched from PS256 to RS256
   const key = await importPKCS8(pkcs8, alg);
   const now = Math.floor(Date.now() / 1000);
-  return await new SignJWT({})
+  const jti = crypto.randomBytes(16).toString('hex');
+
+  return await new SignJWT({ jti })
     .setProtectedHeader({ alg, kid: cfg.oidcKid, typ: 'JWT' })
-    .setIssuer(cfg.clientId)
-    .setSubject(cfg.clientId)
-    .setAudience(aud)
+    .setIssuer(cfg.clientId)     // iss = client_id
+    .setSubject(cfg.clientId)    // sub = client_id
+    .setAudience(aud)            // aud = token endpoint URL
     .setIssuedAt(now)
     .setExpirationTime(now + 300) // 5 minutes
     .sign(key);
@@ -89,10 +91,11 @@ async function createAccountAccessConsent(clientToken) {
   return data?.Data?.ConsentId;
 }
 
-// ---- Helper: build signed Request Object (JWS) embedding ConsentId ----
+// ---- Helper: build signed Request Object (JWS) embedding ConsentId (RS256) ----
 async function buildRequestObject({ consentId, state, nonce }) {
   const pkcs8 = await fs.readFile(cfg.oidcPk, 'utf8');
-  const key = await importPKCS8(pkcs8, 'PS256');
+  const alg = 'RS256'; // <— using RS256 for the request object as well
+  const key = await importPKCS8(pkcs8, alg);
   const now = Math.floor(Date.now() / 1000);
 
   // Per NZ OBL profile, ConsentId goes in id_token claims
@@ -115,11 +118,11 @@ async function buildRequestObject({ consentId, state, nonce }) {
   };
 
   return await new SignJWT(payload)
-    .setProtectedHeader({ alg: 'PS256', kid: cfg.oidcKid, typ: 'JWT' })
+    .setProtectedHeader({ alg, kid: cfg.oidcKid, typ: 'JWT' })
     .sign(key);
 }
 
-// ---- NEW /auth/start: create consent + send only `request` (no request_uri) ----
+// ---- /auth/start: create consent + send only `request` (no request_uri) ----
 app.get('/auth/start', async (req, res) => {
   try {
     const state = crypto.randomBytes(16).toString('hex');
